@@ -47,6 +47,8 @@ from .. import errors
 from .. import types
 from ..suggestions import suggest_symbol
 from ..types import DataType, _DataTypeDef
+from . import temporal as _temporal
+from .temporal import Calendar, DstResolutionPolicy, TemporalSnapshot
 
 from ._attribute_resolver import _AttributeResolver
 
@@ -127,12 +129,14 @@ def type_resolver_from_sqlalchemy(cls: type, *, strict: bool = True) -> Callable
 
 class _ThreadLocalStorage(object):
     """项目内部接口说明。"""
-    __slots__ = ('assignment_scopes', 'regex_groups')
+    __slots__ = ('assignment_scopes', 'regex_groups', 'evaluation_depth')
     assignment_scopes: 'collections.deque[dict[str, ast.Assignment]]'
     regex_groups: tuple[str, ...] | None
+    evaluation_depth: int
     def __init__(self) -> None:
         self.assignment_scopes = collections.deque()
         self.regex_groups = None
+        self.evaluation_depth = 0
 
     def reset(self) -> None:
         self.assignment_scopes.clear()
@@ -149,7 +153,9 @@ class Context(object):
                     default_timezone: str | datetime.tzinfo = 'local',
                     default_value: Any = errors.UNDEFINED,
                     decimal_context: decimal.Context | None = None,
-                    mapping_attribute_lookup: bool = True
+                    mapping_attribute_lookup: bool = True,
+                    calendar: 'Calendar | None' = None,
+                    dst_policy: 'DstResolutionPolicy | str' = DstResolutionPolicy.RAISE
     ) -> None:
         """项目内部接口说明。"""
         self.regex_flags = regex_flags
@@ -161,13 +167,17 @@ class Context(object):
         evaluated.
         """
         if isinstance(default_timezone, str):
-            default_timezone = default_timezone.lower()
-            if default_timezone == 'local':
+            timezone_name = default_timezone
+            if timezone_name.lower() == 'local':
                 default_timezone = dateutil.tz.tzlocal()
-            elif default_timezone == 'utc':
+            elif timezone_name.lower() == 'utc':
                 default_timezone = dateutil.tz.tzutc()
             else:
-                raise ValueError('unsupported timezone: ' + default_timezone)
+                # any other string is treated as an IANA timezone name (e.g. 'America/New_York')
+                resolved = dateutil.tz.gettz(timezone_name)
+                if resolved is None:
+                    raise ValueError('unsupported timezone: ' + timezone_name)
+                default_timezone = resolved
         elif not isinstance(default_timezone, datetime.tzinfo):
             raise TypeError('invalid default_timezone type')
         self._thread_local = threading.local()
@@ -175,6 +185,12 @@ class Context(object):
         """The *default_timezone* parameter from :py:meth:`~__init__`"""
         self.default_value = default_value
         """The *default_value* parameter from :py:meth:`~__init__`"""
+        if calendar is not None and not isinstance(calendar, Calendar):
+            raise TypeError('calendar must be a rule_engine.engine.Calendar instance, got ' + type(calendar).__name__)
+        self.calendar = calendar
+        """节假日/工作日日历（含版本），供时态快照与 ``is_holiday`` 等内置函数使用。"""
+        self.dst_policy = dst_policy if isinstance(dst_policy, DstResolutionPolicy) else DstResolutionPolicy(dst_policy)
+        """无时区时间字面量落入夏令时间隙/重叠时的解析策略。"""
         self.builtins = builtins.Builtins.from_defaults(
                 values={'re_groups': builtins.BuiltinValueGenerator(functools.partial(_tls_getter, self._thread_local, 'regex_groups'))},
                 value_types={'re_groups': types.DataType.ARRAY(types.DataType.STRING)},
@@ -201,6 +217,8 @@ class Context(object):
                 'decimal_context': self.decimal_context,
                 'mapping_attribute_lookup': self.mapping_attribute_lookup,
                 '_mapping_fallback_warned': self._mapping_fallback_warned,
+                'calendar': self.calendar,
+                'dst_policy': self.dst_policy,
                 '_Context__type_resolver': self.__type_resolver,
                 '_Context__resolver': self.__resolver,
         }
@@ -213,6 +231,8 @@ class Context(object):
         self.decimal_context = state['decimal_context']
         self.mapping_attribute_lookup = state['mapping_attribute_lookup']
         self._mapping_fallback_warned = state['_mapping_fallback_warned']
+        self.calendar = state.get('calendar')
+        self.dst_policy = state.get('dst_policy', DstResolutionPolicy.RAISE)
         self.__type_resolver = state['_Context__type_resolver']
         self.__resolver = state['_Context__resolver']
         # recreate transient objects that can not be pickled
@@ -223,6 +243,66 @@ class Context(object):
                 value_types={'re_groups': types.DataType.ARRAY(types.DataType.STRING)},
                 timezone=self.default_timezone
         )
+
+    def make_snapshot(
+            self,
+            now: datetime.datetime | None = None,
+            *,
+            timezone: datetime.tzinfo | str | None = None,
+            calendar: 'Calendar | None' = None,
+            timezone_database_version: str | None = None,
+            dst_policy: 'DstResolutionPolicy | str | None' = None
+    ) -> TemporalSnapshot:
+        """
+        按 Context 的默认值构造时态快照。
+
+        *now* 缺省为当前 UTC 时刻；*timezone* 缺省为 Context 的默认时区；
+        *calendar* 与 *dst_policy* 缺省取 Context 上配置的值。
+        """
+        return TemporalSnapshot(
+                now if now is not None else datetime.datetime.now(tz=datetime.timezone.utc),
+                timezone=timezone if timezone is not None else self.default_timezone,
+                calendar=calendar if calendar is not None else self.calendar,
+                timezone_database_version=timezone_database_version,
+                dst_policy=self.dst_policy if dst_policy is None else dst_policy
+        )
+
+    def localize_naive_datetime(self, value: datetime.datetime, timezone: datetime.tzinfo | None = None) -> datetime.datetime:
+        """
+        把无时区的墙上时刻归入 *timezone*（缺省为默认时区）。
+
+        * 存在活动时态快照时，按快照的业务时区与 DST 策略本地化：夏令时间隙/
+          重叠时刻得到快照声明的明确语义；
+        * 不存在快照（传统路径）时保持历史行为，直接附加时区而不做 DST 检查，
+          因此未使用时态快照的规则承担零额外成本、结果也完全不变。
+        """
+        snapshot = _temporal.get_current_snapshot()
+        if snapshot is not None:
+            return snapshot.localize(value)
+        return value.replace(tzinfo=timezone or self.default_timezone)
+
+    @contextlib.contextmanager
+    def snapshot_scope(self, snapshot: TemporalSnapshot) -> Iterator[None]:
+        """
+        在当前线程上激活 *snapshot* 的求值作用域。
+
+        作用域可重入/嵌套：嵌套期间新建快照（例如子规则以另一个业务时刻评估）
+        只在内层可见，退出后恢复外层快照。未使用时态函数的规则不感知此作用域，
+        也不承担任何额外成本。
+        """
+        if not isinstance(snapshot, TemporalSnapshot):
+            raise TypeError('snapshot must be a TemporalSnapshot instance, got ' + type(snapshot).__name__)
+        _temporal.push_snapshot(snapshot)
+        try:
+            yield
+        finally:
+            _temporal.pop_snapshot()
+
+    def _push_snapshot(self, snapshot: TemporalSnapshot) -> None:
+        _temporal.push_snapshot(snapshot)
+
+    def _pop_snapshot(self) -> None:
+        _temporal.pop_snapshot()
 
     @contextlib.contextmanager
     def assignments(self, *assignments: 'ast.Assignment') -> Iterator[None]:

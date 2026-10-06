@@ -212,7 +212,7 @@ class ExpressionBase(ASTNodeBase):
         # perform a context aware load of value
         value = coerce_value(*args, **kwargs)
         if isinstance(value, datetime.datetime) and value.tzinfo is None:
-            value = value.replace(tzinfo=self.context.default_timezone)
+            value = self.context.localize_naive_datetime(value)
         return value
 
 class LiteralExpressionBase(ExpressionBase):

@@ -30,12 +30,15 @@
 #  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
 
+import collections
+import datetime
 import decimal
 from typing import Any, Iterable, Iterator, TYPE_CHECKING
 
 from .. import errors
 from ..parser import Parser
 from .context import Context
+from .temporal import TemporalSnapshot
 
 if TYPE_CHECKING:
     import graphviz
@@ -68,9 +71,20 @@ class Rule(object):
     def __str__(self) -> str:
         return self.text
 
-    def filter(self, things: Iterable[Any]) -> Iterator[Any]:
+    def filter(
+            self,
+            things: Iterable[Any],
+            *,
+            at: TemporalSnapshot | datetime.datetime | None = None
+    ) -> Iterator[Any]:
         """项目内部接口说明。"""
-        yield from (thing for thing in things if self.matches(thing))
+        if at is None:
+            # legacy fast path: no snapshot machinery of any kind
+            yield from (thing for thing in things if self.matches(thing))
+            return
+        snapshot = at if isinstance(at, TemporalSnapshot) else self.context.make_snapshot(at)
+        with self.context.snapshot_scope(snapshot):
+            yield from (thing for thing in things if self.matches(thing))
 
     @classmethod
     def is_valid(cls, text: str, context: Context | None = None) -> bool:
@@ -81,15 +95,62 @@ class Rule(object):
             return False
         return True
 
-    def evaluate(self, thing: Any) -> Any:
-        """项目内部接口说明。"""
-        self.context._tls.reset()
-        with decimal.localcontext(self.context.decimal_context):
-            return self.statement.evaluate(thing)
+    def evaluate(
+            self,
+            thing: Any,
+            *,
+            at: TemporalSnapshot | datetime.datetime | None = None
+    ) -> Any:
+        """
+        项目内部接口说明。
 
-    def matches(self, thing: Any) -> bool:
+        *at* 给定本次评估的时态输入：:py:class:`~rule_engine.engine.TemporalSnapshot`
+        原样使用，或传入一个 :py:class:`~datetime.datetime` 由 Context 的默认时区、
+        日历与 DST 策略构造快照。快照在整个评估（含嵌套子规则评估）内固定，
+        ``$now``/``$today`` 与所有窗口、截断、日历函数均从它推导。不传 *at* 时走
+        传统路径，不创建任何时态对象。
+        """
+        if at is None:
+            return self._evaluate(thing)
+        snapshot = at if isinstance(at, TemporalSnapshot) else self.context.make_snapshot(at)
+        self.context._push_snapshot(snapshot)
+        try:
+            return self._evaluate(thing)
+        finally:
+            self.context._pop_snapshot()
+
+    def _evaluate(self, thing: Any) -> Any:
+        tls = self.context._tls
+        nested = tls.evaluation_depth > 0
+        if nested:
+            # a nested evaluate() (e.g. a custom function invoking another rule) must not let the inner
+            # evaluation's assignment scopes or regex groups leak into the parent's state
+            saved_scopes = collections.deque(tls.assignment_scopes)
+            saved_groups = tls.regex_groups
+            tls.reset()
+        else:
+            # a top-level evaluation starts from clean per-evaluation state
+            tls.reset()
+        tls.evaluation_depth += 1
+        try:
+            with decimal.localcontext(self.context.decimal_context):
+                return self.statement.evaluate(thing)
+        finally:
+            tls.evaluation_depth -= 1
+            if nested:
+                # restore the parent evaluation's state; the temporal snapshot stack is managed by evaluate()
+                tls.assignment_scopes.clear()
+                tls.assignment_scopes.extend(saved_scopes)
+                tls.regex_groups = saved_groups
+
+    def matches(
+            self,
+            thing: Any,
+            *,
+            at: TemporalSnapshot | datetime.datetime | None = None
+    ) -> bool:
         """项目内部接口说明。"""
-        return bool(self.evaluate(thing))
+        return bool(self.evaluate(thing, at=at))
 
     def to_graphviz(self) -> 'graphviz.Digraph':
         """项目内部接口说明。"""

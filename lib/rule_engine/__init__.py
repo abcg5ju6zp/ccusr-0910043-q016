@@ -37,8 +37,13 @@ from .engine import resolve_item
 from .engine import type_resolver_from_dataclass
 from .engine import type_resolver_from_dict
 from .engine import type_resolver_from_sqlalchemy
+from .engine import Calendar
 from .engine import Context
+from .engine import DstResolutionPolicy
 from .engine import Rule
+from .engine import TemporalSnapshot
+from .engine import temporal_function
+from .engine.temporal import TemporalError
 
 from .errors import AttributeResolutionError
 from .errors import EngineError
@@ -50,15 +55,20 @@ from .types import DataType
 
 __all__ = (
     'AttributeResolutionError',
+    'Calendar',
     'Context',
     'DataType',
+    'DstResolutionPolicy',
     'EngineError',
     'EvaluationError',
     'Rule',
     'RuleSyntaxError',
     'SymbolResolutionError',
+    'TemporalError',
+    'TemporalSnapshot',
     'resolve_attribute',
     'resolve_item',
+    'temporal_function',
     'type_resolver_from_dataclass',
     'type_resolver_from_dict',
     'type_resolver_from_sqlalchemy',

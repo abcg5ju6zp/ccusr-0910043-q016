@@ -162,6 +162,10 @@ class FunctionCallExpression(ExpressionBase):
         except errors.FunctionCallError as error:
             error.function_name = function_name
             raise error
+        except errors.EvaluationError:
+            # already a meaningful engine error with its own semantics (e.g. TemporalError raised by snapshot
+            # operations); re-raise it untouched rather than hiding it behind a generic wrapper
+            raise
         except Exception as error:
             raise errors.FunctionCallError('function call failed', error=error, function_name=function_name) from None
         result = self._new_value(result)

@@ -41,9 +41,19 @@ from typing import Any, Callable, Iterable, Iterator, Mapping
 
 from . import errors
 from . import types
-from .parser.utilities import parse_datetime, parse_float, parse_timedelta
+from .parser.utilities import parse_float, parse_timedelta
 
+import dateutil.parser
 import dateutil.tz
+
+def _temporal():
+    # delayed import to avoid a circular dependency during package initialization
+    from .engine import temporal
+    return temporal
+
+def _current_snapshot():
+    """返回当前评估作用域内的时态快照；未使用快照时为 None（零成本路径）。"""
+    return _temporal().get_current_snapshot()
 
 def _builtin_filter(function: Callable[[Any], Any], iterable: Iterable[Any]) -> tuple[Any, ...]:
     return tuple(filter(function, iterable))
@@ -52,7 +62,18 @@ def _builtin_map(function: Callable[[Any], Any], iterable: Iterable[Any]) -> tup
     return tuple(map(function, iterable))
 
 def _builtin_parse_datetime(builtins: 'Builtins', string: str) -> datetime.datetime:
-    return parse_datetime(string, builtins.timezone)
+    snapshot = _current_snapshot()
+    try:
+        value = dateutil.parser.isoparse(string)
+    except ValueError:
+        raise errors.DatetimeSyntaxError('invalid datetime literal', string) from None
+    if value.tzinfo is None:
+        if snapshot is not None:
+            # naive wall times are interpreted in the snapshot's policy timezone, applying its DST semantics
+            value = snapshot.localize(value)
+        else:
+            value = value.replace(tzinfo=builtins.timezone)
+    return value
 
 def _builtin_random(boundary: Any = None) -> Any:
     if boundary is not None:
@@ -62,10 +83,73 @@ def _builtin_random(boundary: Any = None) -> Any:
     return random.random()
 
 def _builtin_now(builtins: 'Builtins') -> datetime.datetime:
+    snapshot = _current_snapshot()
+    if snapshot is not None:
+        return snapshot.now
     return datetime.datetime.now(tz=builtins.timezone)
 
 def _builtin_today(builtins: 'Builtins') -> datetime.datetime:
+    snapshot = _current_snapshot()
+    if snapshot is not None:
+        # truncate against the snapshot's business timezone so day boundaries are replay-stable
+        return snapshot.today()
     return _builtin_now(builtins).replace(hour=0, minute=0, second=0, microsecond=0)
+
+# ---------------------------------------------------------------------------
+# Temporal builtins (windows, truncation and calendar-aware arithmetic)
+#
+# Every temporal builtin derives its result from the active TemporalSnapshot
+# rather than the wall clock, so identical (rule, thing, snapshot) triples
+# always evaluate identically and can be replayed historically.
+# ---------------------------------------------------------------------------
+def _require_snapshot():
+    snapshot = _current_snapshot()
+    if snapshot is None:
+        raise errors.FunctionCallError(
+                'this temporal builtin requires a TemporalSnapshot; pass one to Rule.evaluate '
+                '(e.g. rule.evaluate(thing, at=TemporalSnapshot.current(...)))')
+    return snapshot
+
+def _as_datetime(value: Any, position: int) -> datetime.datetime | None:
+    if value is None:
+        return None
+    if not isinstance(value, datetime.datetime):
+        raise errors.FunctionCallError('argument #{} must be a datetime value'.format(position))
+    return value
+
+def _builtin_start_of(value: Any, unit: str = 'day') -> datetime.datetime:
+    snapshot = _require_snapshot()
+    return snapshot.start_of(unit, _as_datetime(value, 1))
+
+def _builtin_window(duration: Any, anchor: Any = None) -> tuple[datetime.datetime, datetime.datetime]:
+    snapshot = _require_snapshot()
+    if not isinstance(duration, datetime.timedelta):
+        raise errors.FunctionCallError('argument #1 (duration) must be a timedelta value')
+    return snapshot.window(duration, anchor=_as_datetime(anchor, 2))
+
+def _builtin_window_days(days: Any) -> tuple[datetime.datetime, datetime.datetime]:
+    snapshot = _require_snapshot()
+    if not types.is_natural_number(days):
+        raise errors.FunctionCallError('argument #1 (days) must be a natural number')
+    return snapshot.window_days(int(days))
+
+def _builtin_within(value: Any, start: Any, end: Any) -> bool:
+    snapshot = _require_snapshot()
+    return snapshot.within(_as_datetime(value, 1), _as_datetime(start, 2), _as_datetime(end, 3))
+
+def _builtin_is_holiday(value: Any = None) -> bool:
+    snapshot = _require_snapshot()
+    return snapshot.is_holiday(None if value is None else _as_datetime(value, 1))
+
+def _builtin_is_business_day(value: Any = None) -> bool:
+    snapshot = _require_snapshot()
+    return snapshot.is_business_day(None if value is None else _as_datetime(value, 1))
+
+def _builtin_add_business_days(value: Any, count: Any) -> datetime.datetime:
+    snapshot = _require_snapshot()
+    if not types.is_integer_number(count):
+        raise errors.FunctionCallError('argument #2 (count) must be an integer number')
+    return snapshot.add_business_days(_as_datetime(value, 1), int(count))
 
 def _builtin_parse_datetime_generator(builtins: 'Builtins') -> 'functools.partial[datetime.datetime]':
     return functools.partial(_builtin_parse_datetime, builtins)
@@ -170,7 +254,15 @@ class Builtins(collections.abc.Mapping):
                 'parse_timedelta': parse_timedelta,
                 'random': _builtin_random,
                 'range': _builtin_range,
-                'split': _builtins_split
+                'split': _builtins_split,
+                # temporal operations derived from the active TemporalSnapshot
+                'start_of': _builtin_start_of,
+                'window': _builtin_window,
+                'window_days': _builtin_window_days,
+                'within': _builtin_within,
+                'is_holiday': _builtin_is_holiday,
+                'is_business_day': _builtin_is_business_day,
+                'add_business_days': _builtin_add_business_days
         }
         default_values.update(values or {})
         default_value_types = {
@@ -198,6 +290,47 @@ class Builtins(collections.abc.Mapping):
                         'split',
                         return_type=types.DataType.ARRAY(types.DataType.STRING),
                         argument_types=(types.DataType.STRING, types.DataType.STRING, types.DataType.FLOAT),
+                        minimum_arguments=1
+                ),
+                # temporal operations: all results are derived from the TemporalSnapshot
+                'start_of': types.DataType.FUNCTION(
+                        'start_of',
+                        return_type=types.DataType.DATETIME,
+                        argument_types=(types.DataType.DATETIME, types.DataType.STRING),
+                        minimum_arguments=1
+                ),
+                'window': types.DataType.FUNCTION(
+                        'window',
+                        return_type=types.DataType.ARRAY(types.DataType.DATETIME),
+                        argument_types=(types.DataType.TIMEDELTA, types.DataType.DATETIME),
+                        minimum_arguments=1
+                ),
+                'window_days': types.DataType.FUNCTION(
+                        'window_days',
+                        return_type=types.DataType.ARRAY(types.DataType.DATETIME),
+                        argument_types=(types.DataType.FLOAT,)
+                ),
+                'within': types.DataType.FUNCTION(
+                        'within',
+                        return_type=types.DataType.BOOLEAN,
+                        argument_types=(types.DataType.DATETIME, types.DataType.DATETIME, types.DataType.DATETIME)
+                ),
+                'is_holiday': types.DataType.FUNCTION(
+                        'is_holiday',
+                        return_type=types.DataType.BOOLEAN,
+                        argument_types=(types.DataType.DATETIME,),
+                        minimum_arguments=0
+                ),
+                'is_business_day': types.DataType.FUNCTION(
+                        'is_business_day',
+                        return_type=types.DataType.BOOLEAN,
+                        argument_types=(types.DataType.DATETIME,),
+                        minimum_arguments=0
+                ),
+                'add_business_days': types.DataType.FUNCTION(
+                        'add_business_days',
+                        return_type=types.DataType.DATETIME,
+                        argument_types=(types.DataType.DATETIME, types.DataType.FLOAT),
                         minimum_arguments=1
                 )
         }
