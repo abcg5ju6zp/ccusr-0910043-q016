@@ -42,6 +42,7 @@ from typing import Any, Callable, Iterable, Iterator, Mapping
 from . import errors
 from . import types
 from .parser.utilities import parse_datetime, parse_float, parse_timedelta
+from .temporal import TemporalSnapshot
 
 import dateutil.tz
 
@@ -52,7 +53,10 @@ def _builtin_map(function: Callable[[Any], Any], iterable: Iterable[Any]) -> tup
     return tuple(map(function, iterable))
 
 def _builtin_parse_datetime(builtins: 'Builtins', string: str) -> datetime.datetime:
-    return parse_datetime(string, builtins.timezone)
+    # 朴素时间戳一律按*本次评估快照*的业务时区解释；快照不可用时（直接使用 Builtins）回退到内置时区。
+    snapshot = builtins.get_snapshot()
+    timezone = snapshot.timezone if snapshot is not None else builtins.timezone
+    return parse_datetime(string, timezone)
 
 def _builtin_random(boundary: Any = None) -> Any:
     if boundary is not None:
@@ -62,13 +66,98 @@ def _builtin_random(boundary: Any = None) -> Any:
     return random.random()
 
 def _builtin_now(builtins: 'Builtins') -> datetime.datetime:
+    # $now 的唯一时钟来源是本次评估的时态快照；无快照（直接使用 Builtins）时才读取系统时钟。
+    snapshot = builtins.get_snapshot()
+    if snapshot is not None:
+        return snapshot.now
     return datetime.datetime.now(tz=builtins.timezone)
 
 def _builtin_today(builtins: 'Builtins') -> datetime.datetime:
+    snapshot = builtins.get_snapshot()
+    if snapshot is not None:
+        return snapshot.today
     return _builtin_now(builtins).replace(hour=0, minute=0, second=0, microsecond=0)
 
 def _builtin_parse_datetime_generator(builtins: 'Builtins') -> 'functools.partial[datetime.datetime]':
     return functools.partial(_builtin_parse_datetime, builtins)
+
+def _assert_datetime_argument(value: Any, position: int) -> datetime.datetime:
+    if not isinstance(value, datetime.datetime):
+        raise errors.FunctionCallError('argument #{} must be a datetime value'.format(position))
+    return value
+
+def _assert_integer_argument(value: Any, position: int, name: str) -> int:
+    if not types.is_integer_number(value):
+        raise errors.FunctionCallError('argument #{} ({}) must be an integer number'.format(position, name))
+    return int(value)
+
+def _snapshot_bound(generator_name: str, snapshot: TemporalSnapshot | None) -> TemporalSnapshot:
+    if snapshot is None:
+        raise errors.FunctionCallError(
+                "{} requires a temporal snapshot; evaluate the rule with Rule.evaluate(thing, moment=...) "
+                "or inside a Context.temporal_snapshot() block".format(generator_name)
+        )
+    return snapshot
+
+def _builtin_start_of_day(builtins: 'Builtins') -> Callable[..., Any]:
+    snapshot = builtins.get_snapshot()
+    def start_of_day(value: datetime.datetime) -> datetime.datetime:
+        _snapshot_bound('$start_of_day', snapshot)
+        _assert_datetime_argument(value, 1)
+        return snapshot.start_of_day(value)  # type: ignore[union-attr]
+    return start_of_day
+
+def _builtin_add_days(builtins: 'Builtins') -> Callable[..., Any]:
+    snapshot = builtins.get_snapshot()
+    def add_days(value: datetime.datetime, days: Any) -> datetime.datetime:
+        _snapshot_bound('$add_days', snapshot)
+        _assert_datetime_argument(value, 1)
+        return snapshot.add_calendar_days(_assert_integer_argument(days, 2, 'days'), moment=value)  # type: ignore[union-attr]
+    return add_days
+
+def _builtin_add_months(builtins: 'Builtins') -> Callable[..., Any]:
+    snapshot = builtins.get_snapshot()
+    def add_months(value: datetime.datetime, months: Any) -> datetime.datetime:
+        _snapshot_bound('$add_months', snapshot)
+        _assert_datetime_argument(value, 1)
+        return snapshot.add_calendar_months(_assert_integer_argument(months, 2, 'months'), moment=value)  # type: ignore[union-attr]
+    return add_months
+
+def _builtin_add_business_days(builtins: 'Builtins') -> Callable[..., Any]:
+    snapshot = builtins.get_snapshot()
+    def add_business_days(value: datetime.datetime, days: Any) -> datetime.datetime:
+        _snapshot_bound('$add_business_days', snapshot)
+        _assert_datetime_argument(value, 1)
+        count = _assert_integer_argument(days, 2, 'days')
+        try:
+            return snapshot.add_business_days(count, moment=value)  # type: ignore[union-attr]
+        except errors.EvaluationError:
+            raise errors.FunctionCallError('$add_business_days requires a business calendar on the temporal snapshot') from None
+    return add_business_days
+
+def _builtin_is_holiday(builtins: 'Builtins') -> Callable[..., Any]:
+    snapshot = builtins.get_snapshot()
+    def is_holiday(value: datetime.datetime | None = None) -> bool:
+        _snapshot_bound('$is_holiday', snapshot)
+        if value is not None:
+            _assert_datetime_argument(value, 1)
+        try:
+            return snapshot.is_holiday(value)  # type: ignore[union-attr]
+        except errors.EvaluationError:
+            raise errors.FunctionCallError('$is_holiday requires a business calendar on the temporal snapshot') from None
+    return is_holiday
+
+def _builtin_is_business_day(builtins: 'Builtins') -> Callable[..., Any]:
+    snapshot = builtins.get_snapshot()
+    def is_business_day(value: datetime.datetime | None = None) -> bool:
+        _snapshot_bound('$is_business_day', snapshot)
+        if value is not None:
+            _assert_datetime_argument(value, 1)
+        try:
+            return snapshot.is_business_day(value)  # type: ignore[union-attr]
+        except errors.EvaluationError:
+            raise errors.FunctionCallError('$is_business_day requires a business calendar on the temporal snapshot') from None
+    return is_business_day
 
 def _builtin_range(start: Any, stop: Any = None, step: Any = None) -> list[int]:
     if not types.is_integer_number(start):
@@ -111,13 +200,19 @@ class Builtins(collections.abc.Mapping):
             values: Mapping[str, Any],
             namespace: str | None = None,
             timezone: datetime.tzinfo | None = None,
-            value_types: Mapping[str, 'types._DataTypeDef'] | None = None
+            value_types: Mapping[str, 'types._DataTypeDef'] | None = None,
+            snapshot_provider: Callable[[], TemporalSnapshot | None] | None = None
     ) -> None:
         """项目内部接口说明。"""
         self.__values = values
         self.__value_types = value_types or {}
         self.namespace = namespace
         self.timezone = timezone or dateutil.tz.tzlocal()
+        self.__snapshot_provider = snapshot_provider or (lambda: None)
+
+    def get_snapshot(self) -> TemporalSnapshot | None:
+        """返回当前评估线程上生效的时态快照；未建立快照时为 ``None``。"""
+        return self.__snapshot_provider()
 
     def resolve_type(self, name: str) -> 'types._DataTypeDef':
         """项目内部接口说明。"""
@@ -133,7 +228,12 @@ class Builtins(collections.abc.Mapping):
                 namespace = name
             else:
                 namespace = self.namespace + '.' + name
-            return self.__class__(value, namespace=namespace, timezone=self.timezone)
+            return self.__class__(
+                    value,
+                    namespace=namespace,
+                    timezone=self.timezone,
+                    snapshot_provider=self.__snapshot_provider
+            )
         elif callable(value) and isinstance(value, BuiltinValueGenerator):
             value = value(self)
         return value
@@ -156,6 +256,13 @@ class Builtins(collections.abc.Mapping):
                 # timestamps
                 'now': now,
                 'today': BuiltinValueGenerator(_builtin_today),
+                # temporal functions derived from the per-evaluation temporal snapshot
+                'start_of_day': BuiltinValueGenerator(_builtin_start_of_day),
+                'add_days': BuiltinValueGenerator(_builtin_add_days),
+                'add_months': BuiltinValueGenerator(_builtin_add_months),
+                'add_business_days': BuiltinValueGenerator(_builtin_add_business_days),
+                'is_holiday': BuiltinValueGenerator(_builtin_is_holiday),
+                'is_business_day': BuiltinValueGenerator(_builtin_is_business_day),
                 # functions
                 'abs': abs,
                 'any': any,
@@ -180,6 +287,24 @@ class Builtins(collections.abc.Mapping):
                 # timestamps
                 'now': types.DataType.DATETIME,
                 'today': types.DataType.DATETIME,
+                # temporal functions
+                'start_of_day': types.DataType.FUNCTION(
+                        'start_of_day', return_type=types.DataType.DATETIME, argument_types=(types.DataType.DATETIME,)),
+                'add_days': types.DataType.FUNCTION(
+                        'add_days', return_type=types.DataType.DATETIME,
+                        argument_types=(types.DataType.DATETIME, types.DataType.FLOAT)),
+                'add_months': types.DataType.FUNCTION(
+                        'add_months', return_type=types.DataType.DATETIME,
+                        argument_types=(types.DataType.DATETIME, types.DataType.FLOAT)),
+                'add_business_days': types.DataType.FUNCTION(
+                        'add_business_days', return_type=types.DataType.DATETIME,
+                        argument_types=(types.DataType.DATETIME, types.DataType.FLOAT)),
+                'is_holiday': types.DataType.FUNCTION(
+                        'is_holiday', return_type=types.DataType.BOOLEAN,
+                        argument_types=(types.DataType.DATETIME,), minimum_arguments=0),
+                'is_business_day': types.DataType.FUNCTION(
+                        'is_business_day', return_type=types.DataType.BOOLEAN,
+                        argument_types=(types.DataType.DATETIME,), minimum_arguments=0),
                 # functions
                 'abs': types.DataType.FUNCTION('abs', return_type=types.DataType.FLOAT, argument_types=(types.DataType.FLOAT,)),
                 'all': types.DataType.FUNCTION('all', return_type=types.DataType.BOOLEAN, argument_types=(types.DataType.ARRAY,)),

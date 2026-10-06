@@ -36,6 +36,7 @@ import operator
 from typing import Any, Callable
 
 from ... import errors
+from ...temporal import shift_wall_clock
 from ...types import DataType, coerce_value
 from ...types import _DataTypeDef
 
@@ -71,9 +72,28 @@ class AddExpression(BinaryExpressionBase):
         if isinstance(left_value, datetime.datetime):
             if not isinstance(right_value, datetime.timedelta):
                 raise errors.EvaluationError('data type mismatch (not a timedelta value)')
+            snapshot = self.context.active_temporal_snapshot()
+            if snapshot is None or left_value.tzinfo is None:
+                return operator.add(left_value, right_value)
+            # 日历式加法保持本地钟点；DST gap/重叠按本次评估快照的显式策略解析。
+            return shift_wall_clock(
+                    left_value,
+                    right_value,
+                    disambiguation=snapshot.disambiguation,
+                    gap_policy=snapshot.gap_policy
+            )
         elif isinstance(left_value, datetime.timedelta):
             if not isinstance(right_value, (datetime.timedelta, datetime.datetime)):
                 raise errors.EvaluationError('data type mismatch (not a datetime or timedelta value)')
+            if isinstance(right_value, datetime.datetime) and right_value.tzinfo is not None:
+                snapshot = self.context.active_temporal_snapshot()
+                if snapshot is not None:
+                    return shift_wall_clock(
+                            right_value,
+                            left_value,
+                            disambiguation=snapshot.disambiguation,
+                            gap_policy=snapshot.gap_policy
+                    )
         elif isinstance(left_value, bytes) or isinstance(right_value, bytes):
             _assert_is_bytes(left_value, right_value)
         elif isinstance(left_value, str) or isinstance(right_value, str):
@@ -112,8 +132,17 @@ class SubtractExpression(BinaryExpressionBase):
         left_value = self.left.evaluate(thing)
         right_value = self.right.evaluate(thing)
         if isinstance(left_value, datetime.datetime):
-            if not isinstance(right_value, (datetime.datetime, datetime.timedelta)):
+            if not isinstance(right_value, (datetime.timedelta, datetime.datetime)):
                 raise errors.EvaluationError('data type mismatch (not a datetime or timedelta value)')
+            if isinstance(right_value, datetime.timedelta) and left_value.tzinfo is not None:
+                snapshot = self.context.active_temporal_snapshot()
+                if snapshot is not None:
+                    return shift_wall_clock(
+                            left_value,
+                            -right_value,
+                            disambiguation=snapshot.disambiguation,
+                            gap_policy=snapshot.gap_policy
+                    )
         elif isinstance(left_value, datetime.timedelta):
             if not isinstance(right_value, datetime.timedelta):
                 raise errors.EvaluationError('data type mismatch (not a timedelta value)')
